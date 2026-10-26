@@ -1,0 +1,81 @@
+.ai-usage-button {
+    padding: 0 2px;
+}
+
+.ai-usage-panel {
+    spacing: 0;
+}
+
+.ai-usage-chip {
+    spacing: 4px;
+    padding: 0 1px;
+}
+
+.ai-usage-chip-name {
+    font-weight: bold;
+}
+
+.ai-usage-chip-value {
+    font-weight: normal;
+}
+
+.ai-usage-sep {
+    width: 1px;
+    height: 12px;
+    margin: 0 6px;
+    background-color: rgba(128, 128, 128, 0.55);
+}
+
+.ai-usage-behind {
+    color: #ff5c5c;
+}
+
+.ai-usage-low {
+    color: #e5a50a;
+}
+
+.ai-usage-critical {
+    color: #e01b24;
+}
+
+.ai-usage-card-head {
+    spacing: 6px;
+}
+
+.ai-usage-card-name {
+    font-weight: bold;
+    font-size: 1.08em;
+}
+
+.ai-usage-card-plan {
+    font-size: 0.9em;
+}
+
+.ai-usage-source {
+    font-size: 0.85em;
+}
+
+.ai-usage-summary {
+    font-size: 0.95em;
+}
+
+.ai-usage-window {
+    font-size: 0.9em;
+}
+
+.ai-usage-meter {
+    min-width: 260px;
+    margin: 2px 0 4px 0;
+}
+
+.ai-usage-value {
+    font-weight: bold;
+}
+
+.ai-usage-urgent {
+    color: #e01b24;
+}
+
+.ai-usage-error {
+    color: #e01b24;
+}

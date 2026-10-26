@@ -1,0 +1,7 @@
+[Unit]
+Description=Collect AI provider usage (OMP limits + OpenRouter credits)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/ai-usage/env
+ExecStart=%h/.local/bin/ai-usage --quiet

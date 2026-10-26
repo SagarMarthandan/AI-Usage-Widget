@@ -1,0 +1,9 @@
+{
+  "uuid": "openrouter-credits@sagar.marthandan",
+  "name": "AI Usage",
+  "description": "Weekly Claude, Codex and OpenCode Go limits plus OpenRouter credit, with pace and reset countdowns in the panel.",
+  "shell-version": ["46"],
+  "version": 3,
+  "version-name": "1.0.0",
+  "url": "https://github.com/SagarMarthandan/AI-Usage-Widget"
+}

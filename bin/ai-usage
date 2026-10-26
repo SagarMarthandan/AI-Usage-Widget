@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Collect AI provider usage into one cache record for the panel widget.
+
+Sources:
+  * `omp usage --json` for OpenCode Go, Codex, Anthropic (Claude Code when
+    authenticated) and Antigravity's Claude/GPT shared quota.
+  * OpenRouter `/credits` + `/auth/key` for balance and per-key spend.
+
+The panel extension only reads ~/.cache/ai-usage/status.json; this script is
+the only thing that touches credentials or the network.
+
+API key resolution for OpenRouter:
+  1. $OPENROUTER_API_KEY
+  2. ~/.config/ai-usage/env  (OPENROUTER_API_KEY=...)
+  3. ~/.config/ai-usage/key  (raw key)
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+API_BASE = "https://openrouter.ai/api/v1"
+OMP_TIMEOUT = 60
+HTTP_TIMEOUT = 20
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "ai-usage"
+STATE_DIR = Path(
+    os.environ.get("AI_USAGE_STATE_DIR")
+    or (Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "ai-usage")
+)
+STATUS_PATH = STATE_DIR / "status.json"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+ENV_PATH = CONFIG_DIR / "env"
+KEY_PATH = CONFIG_DIR / "key"
+
+PROVIDER_IDS = ("claude", "codex", "opencode-go", "openrouter")
+DEFAULT_PROVIDERS = list(PROVIDER_IDS)
+
+WINDOW_NAMES = {
+    "5h": "5h",
+    "7d": "7d",
+    "weekly": "weekly",
+    "monthly": "monthly",
+}
+
+PRIMARY_PREFERENCE = {
+    "claude": ["weekly", "7d", "5h"],
+    "codex": ["weekly", "7d", "5h"],
+    "opencode-go": ["monthly", "weekly", "5h"],
+}
+
+
+# --------------------------------------------------------------------- config
+def load_config():
+    config = {
+        "low_threshold": 5.0,
+        "critical_threshold": 1.0,
+        "providers": list(DEFAULT_PROVIDERS),
+    }
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        raw = {}
+    if isinstance(raw, dict):
+        config.update(raw)
+    providers = config.get("providers")
+    if not isinstance(providers, list):
+        providers = DEFAULT_PROVIDERS
+    config["providers"] = [pid for pid in PROVIDER_IDS if pid in providers]
+    return config
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix=".config.", suffix=".json")
+    try:
+        with os.fdopen(handle, "w") as stream:
+            json.dump(config, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, CONFIG_PATH)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def set_provider(provider_id, state):
+    if provider_id not in PROVIDER_IDS:
+        raise SystemExit("unknown provider: {} (choose from {})".format(
+            provider_id, ", ".join(PROVIDER_IDS)))
+    config = load_config()
+    selected = set(config["providers"])
+    if state == "on":
+        selected.add(provider_id)
+    else:
+        selected.discard(provider_id)
+    config["providers"] = [pid for pid in PROVIDER_IDS if pid in selected]
+    save_config(config)
+    return config
+
+
+# --------------------------------------------------------------- credentials
+def resolve_openrouter_key():
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if key:
+        return key
+    if ENV_PATH.is_file():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if line.startswith("OPENROUTER_API_KEY="):
+                value = line.split("=", 1)[1].strip().strip("'\"")
+                if value:
+                    return value
+    if KEY_PATH.is_file():
+        value = KEY_PATH.read_text().strip()
+        if value:
+            return value
+    return None
+
+
+def find_omp():
+    candidates = [
+        os.environ.get("OMP_BIN"),
+        shutil.which("omp"),
+        str(HOME / ".local" / "bin" / "omp"),
+        "/usr/local/bin/omp",
+        "/usr/bin/omp",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+# --------------------------------------------------------------------- OMP
+def run_omp_usage():
+    omp = find_omp()
+    if not omp:
+        raise RuntimeError("omp binary not found")
+    result = subprocess.run(
+        [omp, "usage", "--json", "--redact"],
+        capture_output=True,
+        text=True,
+        timeout=OMP_TIMEOUT,
+        env=os.environ.copy(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            "omp usage exited {}: {}".format(
+                result.returncode, detail[-1] if detail else "no output"
+            )
+        )
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as error:
+        raise RuntimeError("omp usage returned invalid JSON: {}".format(error))
+    if not isinstance(data, dict):
+        raise RuntimeError("omp usage returned an unexpected payload")
+    return data
+
+
+def normalize_limit(raw):
+    window = raw.get("window") or {}
+    amount = raw.get("amount") or {}
+    scope = raw.get("scope") or {}
+    used = amount.get("usedFraction")
+    if isinstance(used, bool) or not isinstance(used, (int, float)):
+        return None
+    resets_at = window.get("resetsAt")
+    duration = window.get("durationMs")
+    return {
+        "id": str(raw.get("id") or ""),
+        "label": str(raw.get("label") or window.get("label") or "Limit"),
+        "window": str(window.get("id") or ""),
+        "used": max(0.0, min(1.0, float(used))),
+        "resets_at": int(resets_at) if isinstance(resets_at, (int, float)) else None,
+        "duration_ms": int(duration) if isinstance(duration, (int, float)) else None,
+        "shared": bool(scope.get("shared")),
+        "shared_group": scope.get("sharedGroup"),
+        "status": str(raw.get("status") or ""),
+    }
+
+
+def choose_primary(provider_id, limits):
+    preference = PRIMARY_PREFERENCE.get(provider_id, ["weekly", "7d", "5h"])
+    for window in preference:
+        for limit in limits:
+            if limit["window"] == window:
+                return limit
+    timed = [limit for limit in limits if limit.get("duration_ms")]
+    if timed:
+        return max(timed, key=lambda limit: limit["duration_ms"])
+    return limits[0] if limits else None
+
+
+def make_provider(provider_id, name, short, plan, limits, source, source_label,
+                  resets_available=None):
+    limits = [limit for limit in limits if limit]
+    primary = choose_primary(provider_id, limits)
+    return {
+        "id": provider_id,
+        "name": name,
+        "short": short,
+        "plan": plan,
+        "limits": limits,
+        "primary": primary["id"] if primary else None,
+        "source": source,
+        "source_label": source_label,
+        "resets_available": resets_available,
+    }
+
+
+def collect_providers():
+    """Return (providers, unavailable, omp_generated_at)."""
+    data = run_omp_usage()
+    reports = {
+        report.get("provider"): report
+        for report in (data.get("reports") or [])
+        if isinstance(report, dict)
+    }
+    providers = []
+    unavailable = []
+
+    # Claude: real Claude Code limits when OMP has an Anthropic credential;
+    # otherwise Antigravity's Claude-scoped share of the Claude & GPT pool.
+    anthropic = reports.get("anthropic")
+    claude_limits = []
+    if anthropic:
+        claude_limits = [
+            entry for entry in map(normalize_limit, anthropic.get("limits") or []) if entry
+        ]
+        plan = (anthropic.get("metadata") or {}).get("planType") or "Claude Code"
+        providers.append(make_provider(
+            "claude", "Claude", "Claude", plan, claude_limits,
+            "anthropic", "Claude Code",
+        ))
+    else:
+        antigravity = reports.get("google-antigravity")
+        seen = set()
+        if antigravity:
+            for raw in antigravity.get("limits") or []:
+                entry = normalize_limit(raw)
+                if not entry or ":anthropic:" not in entry["id"]:
+                    continue
+                key = (entry.get("shared_group") or entry["id"], entry["window"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                claude_limits.append(entry)
+        if claude_limits:
+            providers.append(make_provider(
+                "claude", "Claude", "Claude", "Antigravity", claude_limits,
+                "google-antigravity", "Antigravity · shared with GPT",
+            ))
+        else:
+            unavailable.append({
+                "id": "claude",
+                "name": "Claude",
+                "reason": "not signed in — run `omp login anthropic`",
+            })
+
+    # Codex
+    codex = reports.get("openai-codex")
+    if codex:
+        limits = [
+            entry for entry in map(normalize_limit, codex.get("limits") or []) if entry
+        ]
+        metadata = codex.get("metadata") or {}
+        resets = (codex.get("resetCredits") or {}).get("availableCount")
+        plan = metadata.get("planType") or "Codex"
+        providers.append(make_provider(
+            "codex", "Codex", "Codex", plan, limits, "openai-codex", "Codex",
+            resets_available=resets if isinstance(resets, int) else None,
+        ))
+
+    # OpenCode Go
+    opencode = reports.get("opencode-go")
+    if opencode:
+        limits = [
+            entry for entry in map(normalize_limit, opencode.get("limits") or []) if entry
+        ]
+        plan = (opencode.get("metadata") or {}).get("planType") or "OpenCode Go"
+        providers.append(make_provider(
+            "opencode-go", "OpenCode Go", "Go", plan, limits,
+            "opencode-go", "OpenCode Go",
+        ))
+
+    generated_at = data.get("generatedAt")
+    return providers, unavailable, generated_at if isinstance(generated_at, int) else None
+
+
+# --------------------------------------------------------------- OpenRouter
+def http_json(path, key):
+    request = urllib.request.Request(
+        API_BASE + path,
+        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        payload = json.load(response)
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("unexpected response from " + path)
+    return data
+
+
+def collect_openrouter():
+    key = resolve_openrouter_key()
+    if not key:
+        raise RuntimeError(
+            "no OpenRouter key; set OPENROUTER_API_KEY or write " + str(ENV_PATH)
+        )
+    credits = http_json("/credits", key)
+    key_info = http_json("/auth/key", key)
+
+    total_credits = credits.get("total_credits")
+    total_usage = credits.get("total_usage")
+    remaining = None
+    if isinstance(total_credits, (int, float)) and isinstance(total_usage, (int, float)):
+        remaining = total_credits - total_usage
+    elif isinstance(key_info.get("limit_remaining"), (int, float)):
+        remaining = key_info["limit_remaining"]
+
+    return {
+        "remaining": remaining,
+        "total_credits": total_credits,
+        "total_usage": total_usage,
+        "key": {
+            name: key_info.get(name)
+            for name in (
+                "usage", "usage_daily", "usage_weekly", "usage_monthly",
+                "limit", "limit_remaining", "is_free_tier",
+            )
+        },
+    }
+
+
+# -------------------------------------------------------------------- state
+def read_previous():
+    try:
+        data = json.loads(STATUS_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_status(status):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=str(STATE_DIR), prefix=".status.", suffix=".json")
+    try:
+        with os.fdopen(handle, "w") as stream:
+            json.dump(status, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, STATUS_PATH)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------------- output
+def money(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "-"
+    return "${:,.2f}".format(value)
+
+
+def limit_line(limit):
+    name = WINDOW_NAMES.get(limit["window"], limit["window"] or limit["label"])
+    when = ""
+    if limit.get("resets_at"):
+        remaining = max(0, int(limit["resets_at"] / 1000 - time.time()))
+        days, rest = divmod(remaining, 86400)
+        hours, rest = divmod(rest, 3600)
+        minutes = rest // 60
+        if days:
+            when = " · resets in {}d {}h".format(days, hours)
+        elif hours:
+            when = " · resets in {}h {}m".format(hours, minutes)
+        else:
+            when = " · resets in {}m".format(minutes)
+    return "{}% {}{}".format(round(limit["used"] * 100), name, when)
+
+
+def format_human(status):
+    lines = []
+    providers = status.get("providers") or []
+    checked = status.get("checked_at")
+    if providers or status.get("openrouter"):
+        lines.append("AI usage")
+    for provider in providers:
+        primary = next(
+            (limit for limit in provider.get("limits") or []
+             if limit.get("id") == provider.get("primary")),
+            (provider.get("limits") or [None])[0],
+        )
+        if primary:
+            source = ""
+            if provider.get("source") != "anthropic" and provider.get("id") == "claude":
+                source = "  [" + str(provider.get("source_label")) + "]"
+            elif provider.get("plan"):
+                source = "  [" + str(provider.get("plan")) + "]"
+            lines.append("  {:<12} {}{}".format(provider.get("name", ""), limit_line(primary), source))
+        else:
+            lines.append("  {:<12} no limit data".format(provider.get("name", "")))
+    openrouter = status.get("openrouter") or {}
+    if openrouter:
+        lines.append(
+            "  {:<10} {} left of {} (spent {})".format(
+                "OpenRouter",
+                money(openrouter.get("remaining")),
+                money(openrouter.get("total_credits")),
+                money(openrouter.get("total_usage")),
+            )
+        )
+    for missing in status.get("unavailable") or []:
+        lines.append("  {:<10} {}".format(missing.get("name", ""), missing.get("reason", "")))
+    if not status.get("ok") and status.get("error"):
+        lines.append("  error: " + str(status["error"]))
+    if isinstance(checked, (int, float)):
+        lines.append("checked      " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(checked)))
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Collect AI provider usage into the panel widget cache."
+    )
+    parser.add_argument("--json", action="store_true", help="print the raw status JSON")
+    parser.add_argument("--quiet", action="store_true", help="suppress human output")
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="exit 1 when any source fails (default: still exit 0)",
+    )
+    parser.add_argument(
+        "command", nargs="?",
+        help="optional: 'providers' or 'set-provider <id> <on|off>'",
+    )
+    parser.add_argument("arguments", nargs="*")
+    args = parser.parse_args()
+
+    if args.command == "providers":
+        config = load_config()
+        for provider_id in PROVIDER_IDS:
+            state = "on" if provider_id in config["providers"] else "off"
+            print("{}: {}".format(provider_id, state))
+        return 0
+
+    if args.command == "set-provider":
+        if len(args.arguments) != 2 or args.arguments[1] not in ("on", "off"):
+            parser.error("usage: ai-usage set-provider <{}> <on|off>".format(
+                "|".join(PROVIDER_IDS)))
+        config = set_provider(args.arguments[0], args.arguments[1])
+        if not args.quiet:
+            print("providers: " + ", ".join(config["providers"]))
+        # Fall through to collection so the visible status reflects the
+        # selection immediately instead of at the next timer tick.
+
+    if args.command and args.command != "set-provider":
+        parser.error("unknown command: " + args.command)
+
+    previous = read_previous() or {}
+    status = dict(previous)
+    status.setdefault("providers", [])
+    status.setdefault("unavailable", [])
+    errors = []
+    updated = False
+
+    try:
+        providers, unavailable, generated_at = collect_providers()
+        status["providers_all"] = providers
+        status["unavailable"] = unavailable
+        status["omp_generated_at"] = generated_at
+        updated = True
+    except Exception as error:  # subprocess, JSON, timeouts
+        errors.append("omp: {}: {}".format(type(error).__name__, error))
+
+    try:
+        status["openrouter_all"] = collect_openrouter()
+        updated = True
+    except Exception as error:  # network, HTTP, JSON
+        errors.append("openrouter: {}: {}".format(type(error).__name__, error))
+
+    now = int(time.time())
+    status["checked_at"] = now
+    status["ok"] = not errors
+    status["error"] = "; ".join(errors) if errors else None
+    if updated:
+        status["updated_at"] = now
+
+    # `providers` / `openrouter` are the currently selected view (what the
+    # panel renders); `*_all` keeps every source so a later toggle does not
+    # need a fresh API round trip.
+    config = load_config()
+    selected = set(config["providers"])
+    all_providers = status.get("providers_all") or status.get("providers") or []
+    status["providers_all"] = all_providers
+    status["providers"] = [p for p in all_providers if p.get("id") in selected]
+    status["unavailable"] = [
+        item for item in (status.get("unavailable") or [])
+        if item.get("id") in selected
+    ]
+
+    all_openrouter = status.get("openrouter_all") or status.get("openrouter")
+    if all_openrouter:
+        status["openrouter_all"] = all_openrouter
+    if "openrouter" in selected and all_openrouter:
+        status["openrouter"] = all_openrouter
+    else:
+        status.pop("openrouter", None)
+
+    write_status(status)
+
+    if errors and not args.quiet:
+        print("ai-usage: " + status["error"], file=sys.stderr)
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+    elif not args.quiet:
+        print(format_human(status))
+    return 1 if (args.strict and errors) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
